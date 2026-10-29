@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.qempexe.clipscape",
+  "name": "Clipscape",
+  "version": "1.0.0",
+  "author": "qempexe",
+  "license": "MIT",
+  "description": "Clipboard history for Omarchy that takes over Super+Ctrl+V: text, links, code, colors, files and pictures, searched as you type, with pins you can name, several clips pasted at once, edits and transforms, secrets hidden and forgotten, and a bar panel with every setting.",
+  "kinds": [
+    "service",
+    "overlay",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "qml/Service.qml",
+    "overlay": "qml/Picker.qml",
+    "barWidget": "qml/BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Clipscape",
+    "category": "Productivity",
+    "description": "Clipboard history with search, pins and previews",
+    "aliases": [
+      "clipboard",
+      "clips",
+      "history",
+      "paste",
+      "copy",
+      "snippets"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.clipboard"
+  }
+}
