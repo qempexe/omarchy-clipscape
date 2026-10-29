@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+"""Clipscape's helper. The shell runs it; it never runs on its own.
+
+  clipscape capture [--images 0|1] [--max-text N] [--max-image N] [--skip LIST]
+      wl-paste --watch runs this on every copy. It reads what was copied (text, files or
+      a picture), and prints it as one JSON line for the shell. Pictures are kept in the
+      images folder under their SHA-256. Nothing is printed for a copy marked sensitive,
+      for a copy from a skipped app, or for one that is too big.
+  clipscape copy ID [--paste KEYS] [--clear-after SECONDS]
+      Puts clip ID from history.json back on the clipboard, and with --paste presses the
+      keys that paste it into the window that has focus: shift-insert, ctrl-v,
+      ctrl-shift-v, or type (types the text out).
+  clipscape gc
+      Deletes pictures in the images folder that history.json no longer mentions.
+  clipscape import
+      Prints Omarchy's own clipboard history as Clipscape clips (a JSON list), its
+      pictures copied into the images folder. Run once, the first time.
+  clipscape secure
+      Makes the state folder readable by you alone (0700, files 0600).
+
+Everything stays in ~/.local/state/omarchy-clipscape. No network, no shell.
+"""
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+import urllib.parse
+
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "omarchy-clipscape")
+IMAGES = os.path.join(STATE, "images")
+HISTORY = os.path.join(STATE, "history.json")
+OMARCHY_HISTORY = os.path.expanduser("~/.local/state/omarchy/clipboard-history.json")
+OMARCHY_IMAGES = os.path.expanduser("~/.local/state/omarchy/clipboard-images")
+
+IMAGE_TYPES = [("image/png", "png"), ("image/jpeg", "jpg"), ("image/webp", "webp"), ("image/gif", "gif"),
+               ("image/bmp", "bmp"), ("image/tiff", "tiff")]
+EXT_OF = dict(IMAGE_TYPES)
+TEXT_TYPES = ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING", "TEXT"]
+IMAGE_NAME = re.compile(r"^[0-9a-f]{64}\.(png|jpg|webp|gif|bmp|tiff)$")
+MAX_HISTORY_FILE = 256 * 1024 * 1024
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def private_dirs():
+    old = os.umask(0o077)
+    try:
+        os.makedirs(IMAGES, mode=0o700, exist_ok=True)
+    finally:
+        os.umask(old)
+    for d in (STATE, IMAGES):
+        st = os.lstat(d)
+        if stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode) and st.st_mode & 0o077:
+            os.chmod(d, 0o700)
+
+
+def run(args, limit, timeout=2.0, data=None):
+    """Runs a command, its output read up to `limit` bytes. None when it fails,
+    takes too long, or gives more than `limit` bytes."""
+    try:
+        p = subprocess.Popen(args, stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+    try:
+        if data is not None:
+            p.stdin.write(data)
+            p.stdin.close()
+        out = bytearray()
+        deadline = time.monotonic() + timeout
+        os.set_blocking(p.stdout.fileno(), False)
+        while True:
+            if time.monotonic() > deadline:
+                p.kill()
+                return None
+            try:
+                chunk = p.stdout.read(65536)
+            except BlockingIOError:
+                chunk = None
+            if chunk:
+                out += chunk
+                if len(out) > limit:
+                    p.kill()
+                    return None
+            elif chunk == b"":
+                break
+            else:
+                time.sleep(0.005)
+        p.wait(timeout=max(0.1, deadline - time.monotonic()))
+        return bytes(out) if p.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            p.kill()
+        except OSError:
+            pass
+        return None
+
+
+def active_app():
+    out = run(["hyprctl", "-j", "activewindow"], 65536, timeout=1.0)
+    if not out:
+        return ""
+    try:
+        cls = json.loads(out.decode("utf-8", "replace")).get("class", "")
+    except (ValueError, AttributeError):
+        return ""
+    return re.sub(r"[^\w .+-]", "", str(cls))[:64]
+
+
+def decode_text(raw):
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        try:
+            return raw.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("utf-8", "replace")
+
+
+def image_size(data, mime):
+    """Width and height from the file's header, or (0, 0)."""
+    try:
+        if mime == "image/png" and data[:8] == b"\x89PNG\r\n\x1a\n":
+            return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+        if mime == "image/gif" and data[:4] == b"GIF8":
+            return int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")
+        if mime == "image/bmp" and data[:2] == b"BM":
+            return int.from_bytes(data[18:22], "little", signed=True), abs(int.from_bytes(data[22:26], "little", signed=True))
+        if mime == "image/webp" and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            kind = data[12:16]
+            if kind == b"VP8X":
+                return 1 + int.from_bytes(data[24:27], "little"), 1 + int.from_bytes(data[27:30], "little")
+            if kind == b"VP8 ":
+                return int.from_bytes(data[26:28], "little") & 0x3FFF, int.from_bytes(data[28:30], "little") & 0x3FFF
+            if kind == b"VP8L":
+                b = int.from_bytes(data[21:25], "little")
+                return (b & 0x3FFF) + 1, ((b >> 14) & 0x3FFF) + 1
+        if mime == "image/jpeg" and data[:2] == b"\xff\xd8":
+            i = 2
+            while i + 9 < len(data):
+                if data[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = data[i + 1]
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    return int.from_bytes(data[i + 7:i + 9], "big"), int.from_bytes(data[i + 5:i + 7], "big")
+                if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                    i += 2
+                    continue
+                i += 2 + int.from_bytes(data[i + 2:i + 4], "big")
+    except (IndexError, ValueError):
+        pass
+    return 0, 0
+
+
+def keep_image(data, mime):
+    """Saves the picture as images/<sha256>.<ext>, readable by you alone. Its path."""
+    private_dirs()
+    ext = EXT_OF[mime]
+    path = os.path.join(IMAGES, hashlib.sha256(data).hexdigest() + "." + ext)
+    if not os.path.lexists(path):
+        tmp = os.path.join(IMAGES, "tmp-%d-%d" % (os.getpid(), time.monotonic_ns()))
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)
+        finally:
+            if os.path.lexists(tmp):
+                os.unlink(tmp)
+    return path
+
+
+def drain_stdin():
+    """wl-paste --watch hands the copy on stdin too; it is read here and dropped, so
+    wl-paste never blocks writing it, and read again below with its type known."""
+    try:
+        if sys.stdin is None or sys.stdin.isatty():
+            return
+        while sys.stdin.buffer.read(1 << 20):
+            pass
+    except (OSError, ValueError):
+        pass
+
+
+def capture(opts):
+    drain_stdin()
+    state = os.environ.get("CLIPBOARD_STATE", "data")
+    if state in ("sensitive", "clear", "nil"):
+        return 0
+    listed = run(["wl-paste", "--list-types"], 65536)
+    if listed is None:
+        return 0
+    types = [t.strip() for t in listed.decode("utf-8", "replace").splitlines() if t.strip()]
+    # password managers mark what they copy; it is never kept
+    if "x-kde-passwordManagerHint" in types:
+        return 0
+    app = active_app()
+    skip = [s.strip().lower() for s in opts.get("skip", "").split(",") if s.strip()]
+    if app and any(s in app.lower() for s in skip):
+        return 0
+
+    clip = None
+    text_type = "text/uri-list" if "text/uri-list" in types else next((t for t in TEXT_TYPES if t in types), "")
+    if text_type:
+        raw = run(["wl-paste", "--no-newline", "--type", text_type], opts["max_text"])
+        if raw:
+            text = decode_text(raw)
+            if text.strip():
+                clip = {"kind": "text", "text": text}
+                # one copied picture file: the list may show it, while it is there
+                if text_type == "text/uri-list":
+                    paths = [l.strip() for l in text.splitlines() if l.strip() and not l.startswith("#")]
+                    if len(paths) == 1 and paths[0].startswith("file://"):
+                        path = paths[0][7:]
+                        if path.startswith("localhost/"):
+                            path = path[9:]
+                        path = urllib.parse.unquote(path)
+                        if re.search(r"\.(png|jpe?g|webp|gif|bmp)$", path, re.I) and os.path.isfile(path):
+                            clip["thumb"] = True
+    if clip is None and opts["images"]:
+        mime = next((m for m, _ in IMAGE_TYPES if m in types), "")
+        if mime:
+            data = run(["wl-paste", "--type", mime], opts["max_image"], timeout=4.0)
+            if data:
+                w, h = image_size(data, mime)
+                clip = {"kind": "image", "path": keep_image(data, mime), "mime": mime, "w": w, "h": h, "bytes": len(data)}
+    if clip is None:
+        return 0
+    clip["app"] = app
+    clip["at"] = now_ms()
+    sys.stdout.write(json.dumps(clip, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
+def read_history():
+    try:
+        fd = os.open(HISTORY, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return []
+    with os.fdopen(fd, "rb") as f:
+        raw = f.read(MAX_HISTORY_FILE + 1)
+    if len(raw) > MAX_HISTORY_FILE:
+        return []
+    try:
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        return []
+    clips = data.get("clips") if isinstance(data, dict) else data
+    return clips if isinstance(clips, list) else []
+
+
+def image_path_ok(path):
+    """Only a picture in Clipscape's own images folder, as a regular file."""
+    if not isinstance(path, str) or os.path.dirname(path) != IMAGES or not IMAGE_NAME.match(os.path.basename(path)):
+        return False
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def wl_copy(args, data):
+    """wl-copy keeps running in the background to serve the clipboard, so its output
+    is not waited for."""
+    try:
+        p = subprocess.Popen(["wl-copy"] + args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        p.stdin.write(data)
+        p.stdin.close()
+        p.wait(timeout=5)
+        return p.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+KEYS = {
+    "shift-insert": ["-M", "shift", "-k", "Insert", "-m", "shift"],
+    "ctrl-v": ["-M", "ctrl", "-k", "v", "-m", "ctrl"],
+    "ctrl-shift-v": ["-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl"],
+}
+
+
+def clear_later(seconds, digest):
+    """Clears the clipboard after `seconds`, if it still holds what was put there."""
+    if os.fork() != 0:
+        return
+    os.setsid()
+    if os.fork() != 0:
+        os._exit(0)
+    try:
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
+        time.sleep(seconds)
+        now = run(["wl-paste", "--no-newline"], 64 * 1024 * 1024)
+        if now is not None and hashlib.sha256(now).hexdigest() == digest:
+            subprocess.run(["wl-copy", "--clear"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    finally:
+        os._exit(0)
+
+
+def copy(clip_id, keys, clear_after):
+    if not re.match(r"^[a-z0-9-]{1,40}$", clip_id or ""):
+        return 2
+    clip = next((c for c in read_history() if isinstance(c, dict) and c.get("id") == clip_id), None)
+    if clip is None:
+        return 1
+    typed = None
+    if clip.get("kind") == "image":
+        path = clip.get("path")
+        mime = clip.get("mime") if clip.get("mime") in EXT_OF else "image/png"
+        if not image_path_ok(path):
+            return 1
+        with open(path, "rb") as f:
+            data = f.read()
+        ok = wl_copy(["--type", mime], data)
+        if keys == "type":
+            keys = "shift-insert"
+    else:
+        text = clip.get("text")
+        if not isinstance(text, str) or text == "":
+            return 1
+        data = text.encode("utf-8")
+        files = all(l.startswith("file://") for l in text.strip().splitlines() if l.strip())
+        ok = wl_copy(["--type", "text/uri-list"] if files else [], data)
+        typed = data
+    if not ok:
+        return 1
+    if clear_after > 0 and typed is not None:
+        clear_later(clear_after, hashlib.sha256(typed).hexdigest())
+    if keys:
+        # the picker or panel has to be gone, and the window under it focused again
+        time.sleep(0.22)
+        if keys == "type" and typed is not None:
+            subprocess.run(["wtype", "-"], input=typed, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        elif keys in KEYS:
+            subprocess.run(["wtype"] + KEYS[keys], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    return 0
+
+
+def gc():
+    keep = set()
+    for c in read_history():
+        if isinstance(c, dict) and c.get("kind") == "image" and isinstance(c.get("path"), str):
+            keep.add(os.path.basename(c["path"]))
+    try:
+        names = os.listdir(IMAGES)
+    except OSError:
+        return 0
+    old = time.time() - 3600
+    removed = 0
+    for name in names:
+        path = os.path.join(IMAGES, name)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        stale_tmp = name.startswith("tmp-") and st.st_mtime < old
+        if (IMAGE_NAME.match(name) and name not in keep) or stale_tmp:
+            os.unlink(path)
+            removed += 1
+    print(json.dumps({"removed": removed}))
+    return 0
+
+
+def import_omarchy(max_image):
+    try:
+        st = os.stat(OMARCHY_HISTORY)
+        if st.st_size > MAX_HISTORY_FILE:
+            raise OSError
+        with open(OMARCHY_HISTORY, "rb") as f:
+            data = json.loads(f.read().decode("utf-8", "replace"))
+    except (OSError, ValueError):
+        print("[]")
+        return 0
+    base = int(st.st_mtime * 1000)
+    out = []
+    for i, v in enumerate(data if isinstance(data, list) else []):
+        if len(out) >= 2000:
+            break
+        at = base - i * 1000
+        if isinstance(v, str):
+            v = {"type": "text", "text": v}
+        if not isinstance(v, dict):
+            continue
+        if v.get("type") == "text" and isinstance(v.get("text"), str) and v["text"].strip():
+            out.append({"kind": "text", "text": v["text"], "at": at})
+        elif v.get("type") == "image" and isinstance(v.get("path"), str):
+            path = os.path.realpath(v["path"])
+            mime = v.get("mime") if v.get("mime") in EXT_OF else ""
+            if not mime or os.path.dirname(path) != os.path.realpath(OMARCHY_IMAGES):
+                continue
+            try:
+                if not stat.S_ISREG(os.stat(path).st_mode) or os.path.getsize(path) > max_image:
+                    continue
+                with open(path, "rb") as f:
+                    raw = f.read()
+            except OSError:
+                continue
+            w, h = image_size(raw, mime)
+            out.append({"kind": "image", "path": keep_image(raw, mime), "mime": mime, "w": w, "h": h,
+                        "bytes": len(raw), "at": at})
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
+def secure():
+    private_dirs()
+    for name in os.listdir(STATE):
+        path = os.path.join(STATE, name)
+        st = os.lstat(path)
+        if stat.S_ISREG(st.st_mode) and st.st_mode & 0o077:
+            os.chmod(path, 0o600)
+    for name in os.listdir(IMAGES):
+        path = os.path.join(IMAGES, name)
+        st = os.lstat(path)
+        if stat.S_ISREG(st.st_mode) and st.st_mode & 0o077:
+            os.chmod(path, 0o600)
+    print(json.dumps({"ok": True}))
+    return 0
+
+
+def number(v, lo, hi, default):
+    try:
+        return max(lo, min(hi, int(v)))
+    except (TypeError, ValueError):
+        return default
+
+
+def main(argv):
+    if not argv:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    cmd, rest = argv[0], argv[1:]
+    flags = {}
+    pos = []
+    i = 0
+    while i < len(rest):
+        if rest[i].startswith("--") and i + 1 < len(rest):
+            flags[rest[i][2:]] = rest[i + 1]
+            i += 2
+        else:
+            pos.append(rest[i])
+            i += 1
+    if cmd == "capture":
+        return capture({
+            "images": flags.get("images", "1") == "1",
+            "max_text": number(flags.get("max-text"), 1024, 1048576 * 4, 262144),
+            "max_image": number(flags.get("max-image"), 65536, 100 * 1048576, 20 * 1048576),
+            "skip": flags.get("skip", "")[:1024],
+        })
+    if cmd == "copy" and pos:
+        keys = flags.get("paste", "")
+        if keys not in ("", "type") and keys not in KEYS:
+            keys = ""
+        return copy(pos[0], keys, number(flags.get("clear-after"), 0, 600, 0))
+    if cmd == "gc":
+        return gc()
+    if cmd == "import":
+        return import_omarchy(number(flags.get("max-image"), 65536, 100 * 1048576, 20 * 1048576))
+    if cmd == "secure":
+        return secure()
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
