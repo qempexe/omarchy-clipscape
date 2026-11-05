@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.qempexe.clipscape",
   "name": "Clipscape",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "qempexe",
   "license": "MIT",
   "description": "Clipboard history for Omarchy that takes over Super+Ctrl+V: text, links, code, colors, files and pictures, searched as you type, with pins you can name, several clips pasted at once, edits and transforms, secrets hidden and forgotten, and a bar panel with every setting.",

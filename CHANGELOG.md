@@ -4,6 +4,14 @@ All notable changes to Clipscape. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] - 2026-11-05
+
+### Fixed
+
+- On Omarchy 4.5, where the bar's window spans the screen, the panel didn't open, or
+  opened over the bar. It now opens off the bar's outer edge, on any edge and with any
+  bar size.
+
 ## [1.0.0] - 2026-10-29
 
 ### Added
@@ -32,4 +40,5 @@ All notable changes to Clipscape. The format follows
   `clear` and `status`.
 - Tests: `node tests/test_model.js` and `python3 tests/test_helper.py`.
 
+[1.0.1]: https://github.com/qempexe/omarchy-clipscape/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/qempexe/omarchy-clipscape/releases/tag/v1.0.0
